@@ -376,11 +376,15 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         }
     }
 
-    // To achieve the desired output bit depth, we must derive a scaling factor for it
-    const output_value_scaling = if (frame.bit_depth >= decoder.bit_depth)
-        @as(f32, @floatFromInt(@as(u32, 1) << @as(u5, @intCast(frame.bit_depth - decoder.bit_depth))))
+    // The dequantization + IDCT math below is calibrated to emit 10-bit sample values (note that the baked-in DC
+    // offset 4096 / S[0]^2 = 512 is the 10-bit midpoint). To reach the desired output bit depth, we scale relative to
+    // this fixed 10-bit baseline. Scaling relative to decoder.bit_depth instead would be wrong for 12-bit sources
+    // (ap4h/ap4x): a native 12-bit decode would get a scaling factor of 1 and come out 4x too dark.
+    const dequant_bit_depth = 10;
+    const output_value_scaling = if (frame.bit_depth >= dequant_bit_depth)
+        @as(f32, @floatFromInt(@as(u32, 1) << @as(u5, @intCast(frame.bit_depth - dequant_bit_depth))))
     else
-        1 / @as(f32, @floatFromInt(@as(u32, 1) << @as(u5, @intCast(decoder.bit_depth - frame.bit_depth))));
+        1 / @as(f32, @floatFromInt(@as(u32, 1) << @as(u5, @intCast(dequant_bit_depth - frame.bit_depth))));
     decoder.dc_offset = output_value_scaling * (comptime 4096 / (S[0] * S[0]));
 
     // Fold the dequantization, AAN scaling factors and bit depth scaling into a single matrix
