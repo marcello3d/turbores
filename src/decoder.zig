@@ -232,9 +232,15 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     var reader = misc.ByteReader.init(decoder.packet);
 
     const frame_size: usize = try reader.takeInt(u32);
-    if (frame_size < 28 or reader.data.len < frame_size) {
+    if (reader.data.len < frame_size) {
         @branchHint(.unlikely);
         decoder.error_message = "Packet is smaller than the frame size indicated in the frame header.";
+        return error.InvalidData;
+    }
+
+    if (frame_size < 28) {
+        @branchHint(.unlikely);
+        decoder.error_message = "Frame size is smaller than the fixed frame header.";
         return error.InvalidData;
     }
 
@@ -248,7 +254,6 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
     }
 
     const header_size: usize = try reader.takeInt(u16);
-    if (header_size < 20 or header_size > frame_size - 8) return error.InvalidData;
 
     const version = try reader.takeInt(u16);
     if (version > 1) {
@@ -261,7 +266,20 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
 
     const frame_width = try reader.takeInt(u16);
     const frame_height = try reader.takeInt(u16);
-    if (frame_width == 0 or frame_height == 0 or frame_width > 16384 or frame_height > 16384) {
+    if (frame_width == 0 or frame_height == 0) {
+        @branchHint(.unlikely);
+        decoder.error_message = std.fmt.bufPrint(
+            &error_print_buffer,
+            "Frame dimensions ({}x{}) must be non-zero.",
+            .{ frame_width, frame_height },
+        ) catch |err| switch (err) {
+            error.NoSpaceLeft => return error.OutOfMemory,
+        };
+
+        return error.InvalidData;
+    }
+
+    if (frame_width > 16384 or frame_height > 16384) {
         @branchHint(.unlikely);
         decoder.error_message = std.fmt.bufPrint(
             &error_print_buffer,
@@ -336,6 +354,21 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         (try reader.takeArray(64)).*
     else
         q_mat_luma; // When no chroma matrix is sent, the luma matrix is reused for chroma
+
+    const header_end = 8 + header_size;
+    if (header_end < reader.pos) {
+        @branchHint(.unlikely);
+        decoder.error_message = "Frame header size too small.";
+        return error.InvalidData;
+    }
+
+    if (header_end > reader.data.len) {
+        @branchHint(.unlikely);
+        decoder.error_message = "Frame header extends past the end of the frame.";
+        return error.InvalidData;
+    }
+
+    reader.pos = header_end;
 
     const has_alpha = alpha_bit_depth != 0;
     const actual_pixel_format = getYuvPixelFormat(
@@ -471,14 +504,6 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
 
     frame.frame_data = try gpa.realloc(frame.frame_data, frame_data_size);
 
-    if (8 + header_size < reader.pos) {
-        @branchHint(.unlikely);
-        decoder.error_message = "Frame header size too small.";
-        return error.InvalidData;
-    }
-
-    reader.pos = 8 + header_size;
-
     const field_coded_height = frame.coded_height >> row_stride_shift;
     const first_field_offset: u32 = if (frame_type == 2) 1 else 0;
 
@@ -568,18 +593,6 @@ fn parsePicture(
     const pic_header_start_pos = reader.pos;
     const pic_header_size: usize = try reader.takeInt(u8) >> 3;
     const pic_data_size: usize = try reader.takeInt(u32);
-
-    // Protect against overflow
-    const pic_data_end = try std.math.add(usize, pic_header_start_pos, pic_data_size);
-
-    if (pic_data_size < 8 or pic_header_size < 8 or pic_header_size > pic_data_size or reader.data.len < pic_data_end) {
-        @branchHint(.unlikely);
-        decoder.error_message = "Packet is smaller than the picture data size indicated in the picture header.";
-        return error.InvalidData;
-    }
-
-    reader.data = reader.data[0..pic_data_end];
-
     const total_slices: u32 = try reader.takeInt(u16);
     const slice_dimensions = try reader.takeInt(u8);
 
@@ -589,6 +602,22 @@ fn parsePicture(
         return error.InvalidData;
     }
 
+    if (pic_header_size > pic_data_size) {
+        @branchHint(.unlikely);
+        decoder.error_message = "Picture header extends past the end of the picture data.";
+        return error.InvalidData;
+    }
+
+    // Protect against overflow
+    const pic_data_end = try std.math.add(usize, pic_header_start_pos, pic_data_size);
+
+    if (reader.data.len < pic_data_end) {
+        @branchHint(.unlikely);
+        decoder.error_message = "Packet is smaller than the picture data size indicated in the picture header.";
+        return error.InvalidData;
+    }
+
+    reader.data = reader.data[0..pic_data_end];
     reader.pos = pic_header_start_pos + pic_header_size;
 
     const log2_slice_width = slice_dimensions >> 4;

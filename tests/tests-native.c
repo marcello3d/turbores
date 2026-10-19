@@ -249,70 +249,140 @@ static int runCase(const TestCase *test_case, uint32_t threads) {
     return 0;
 }
 
-static int runMalformedHeaders(uint32_t threads) {
-    static const struct {
+typedef struct FieldWrite {
+    size_t offset;
+    size_t size;
+    uint32_t value;
+} FieldWrite;
+
+static uint32_t readBigEndian(const uint8_t *data, size_t size) {
+    uint32_t value = 0;
+    for (size_t i = 0; i < size; i++) {
+        value = (value << 8) | data[i];
+    }
+    return value;
+}
+
+static void writeBigEndian(uint8_t *data, size_t size, uint32_t value) {
+    for (size_t i = 0; i < size; i++) {
+        data[i] = (uint8_t) (value >> (8 * (size - i - 1)));
+    }
+}
+
+static int messageContains(TurboresDecoder *decoder, const char *needle) {
+    const char *message = (const char *) turbores_decoder_error_message_ptr(decoder);
+    size_t message_size = turbores_decoder_error_message_size(decoder);
+    size_t needle_size = strlen(needle);
+    if (!message) {
+        return 0;
+    }
+    for (size_t i = 0; i + needle_size <= message_size; i++) {
+        if (memcmp(message + i, needle, needle_size) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int runMalformedHeaders(void) {
+    const uint32_t threads = 1;
+    const TestCase *base_case = &test_cases[0];
+    size_t packet_size;
+    uint8_t *original = readFile(base_case->packet_path, &packet_size);
+    uint8_t *packet = malloc(packet_size);
+
+    const uint32_t frame_size = readBigEndian(original, 4);
+    const uint32_t header_size = readBigEndian(original + 8, 2);
+    const size_t picture = 8 + header_size;
+    const uint32_t picture_header_size = original[picture] >> 3;
+
+    const struct {
         const char *name;
-        size_t offset;
-        size_t size;
-        uint32_t value;
+        FieldWrite writes[2];
+        int32_t expected_result;
+        const char *expected_message;
     } cases[] = {
-        { "Zero frame size", 0, 4, 0 },
-        { "Frame size before reader position", 0, 4, 2 },
-        { "Short frame size", 0, 4, 27 },
-        { "Frame size past packet", 0, 4, 37 },
-        { "Short frame header", 8, 2, 19 },
-        { "Frame header past packet", 8, 2, 65535 },
-        { "Zero frame width", 16, 2, 0 },
-        { "Zero frame height", 18, 2, 0 },
-        { "Zero picture header", 28, 1, 0 },
-        { "Short picture header", 28, 1, 7 << 3 },
-        { "Picture header past picture", 28, 1, 9 << 3 },
-        { "Zero picture size", 29, 4, 0 },
-        { "Short picture size", 29, 4, 7 },
-        { "Picture size past packet", 29, 4, 9 },
+        { "Zero frame size", { { 0, 4, 0 } }, TURBORES_ERROR_INVALID_DATA, "smaller than the fixed frame header" },
+        { "Frame size before reader position", { { 0, 4, 2 } }, TURBORES_ERROR_INVALID_DATA, "smaller than the fixed frame header" },
+        { "Short frame size", { { 0, 4, 27 } }, TURBORES_ERROR_INVALID_DATA, "smaller than the fixed frame header" },
+        { "Frame size past packet", { { 0, 4, (uint32_t) packet_size + 1 } }, TURBORES_ERROR_INVALID_DATA, "smaller than the frame size" },
+        { "Short frame header", { { 8, 2, 19 } }, TURBORES_ERROR_INVALID_DATA, "Frame header size too small" },
+        {
+            "Frame header past frame",
+            { { 0, 4, (uint32_t) picture }, { 8, 2, header_size + 1 } },
+            TURBORES_ERROR_INVALID_DATA,
+            "Frame header extends past the end of the frame",
+        },
+        { "Zero frame width", { { 16, 2, 0 } }, TURBORES_ERROR_INVALID_DATA, "must be non-zero" },
+        { "Zero frame height", { { 18, 2, 0 } }, TURBORES_ERROR_INVALID_DATA, "must be non-zero" },
+        { "Zero picture header", { { picture, 1, 0 } }, TURBORES_ERROR_INVALID_DATA, "Picture header size too small" },
+        { "Short picture header", { { picture, 1, 7 << 3 } }, TURBORES_ERROR_INVALID_DATA, "Picture header size too small" },
+        { "Zero picture size", { { picture + 1, 4, 0 } }, TURBORES_ERROR_INVALID_DATA, "Picture header extends past" },
+        {
+            "Picture size shorter than picture header",
+            { { picture + 1, 4, picture_header_size - 1 } },
+            TURBORES_ERROR_INVALID_DATA,
+            "Picture header extends past",
+        },
+        {
+            "Picture size past frame",
+            { { picture + 1, 4, frame_size - (uint32_t) picture + 1 } },
+            TURBORES_ERROR_INVALID_DATA,
+            "smaller than the picture data size",
+        },
     };
-    static const uint8_t header[36] = {
-        [3] = 36,
-        [4] = 'i', [5] = 'c', [6] = 'p', [7] = 'f',
-        [9] = 20,
-        [17] = 16, [19] = 16,
-        [20] = 0x80,
-        [28] = 8 << 3,
-        [32] = 8,
-    };
-    TurboresDecoder *decoder = turbores_decoder_create(threads, 10, TURBORES_ALL_PIXEL_FORMATS);
+
+    TurboresDecoder *decoder = turbores_decoder_create(threads, base_case->bit_depth, TURBORES_ALL_PIXEL_FORMATS);
     TurboresFrame *frame = turbores_frame_create();
     if (!decoder || !frame) {
-        if (frame) turbores_frame_destroy(frame);
-        if (decoder) turbores_decoder_destroy(decoder);
-        return 1;
+        fprintf(stderr, "FAILED: Malformed headers: could not create decoder or frame\n");
+        exit(1);
     }
 
     int failures = 0;
+    int32_t control_result = turbores_decode(decoder, frame, original, packet_size);
+    if (control_result != 0) {
+        fprintf(stderr, "FAILED: Malformed headers: unmodified packet returned %d\n", control_result);
+        failures++;
+    }
+
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        uint8_t packet[sizeof(header)];
-        memcpy(packet, header, sizeof(packet));
-        for (size_t byte = 0; byte < cases[i].size; byte++) {
-            packet[cases[i].offset + byte] = (uint8_t) (cases[i].value >> (8 * (cases[i].size - byte - 1)));
+        memcpy(packet, original, packet_size);
+        for (size_t w = 0; w < sizeof(cases[i].writes) / sizeof(cases[i].writes[0]); w++) {
+            const FieldWrite *write = &cases[i].writes[w];
+            if (write->size > 0) {
+                writeBigEndian(packet + write->offset, write->size, write->value);
+            }
         }
-        int32_t result = turbores_decode(decoder, frame, packet, sizeof(packet));
-        if (result != TURBORES_ERROR_INVALID_DATA && result != TURBORES_ERROR_NOT_SUPPORTED) {
-            fprintf(stderr, "FAILED: %s (threads %u): returned %d\n", cases[i].name, threads, result);
+
+        int32_t result = turbores_decode(decoder, frame, packet, packet_size);
+        if (result != cases[i].expected_result || !messageContains(decoder, cases[i].expected_message)) {
+            fprintf(
+                stderr,
+                "FAILED: %s: returned %d (expected %d): %.*s\n",
+                cases[i].name,
+                result,
+                cases[i].expected_result,
+                (int) turbores_decoder_error_message_size(decoder),
+                (const char *) turbores_decoder_error_message_ptr(decoder)
+            );
             failures++;
         }
     }
 
-    for (size_t size = 0; size < 28; size++) {
-        if (turbores_decode(decoder, frame, header, size) >= 0) {
-            fprintf(stderr, "FAILED: Truncated header of %zu bytes (threads %u)\n", size, threads);
+    for (size_t size = 0; size < picture + 8; size++) {
+        if (turbores_decode(decoder, frame, original, size) >= 0) {
+            fprintf(stderr, "FAILED: Packet truncated to %zu bytes was accepted\n", size);
             failures++;
         }
     }
 
     turbores_frame_destroy(frame);
     turbores_decoder_destroy(decoder);
+    free(packet);
+    free(original);
     if (failures == 0) {
-        printf("ok - Malformed and truncated headers (threads %u)\n", threads);
+        printf("ok - Malformed and truncated headers\n");
     }
     return failures;
 }
@@ -322,13 +392,12 @@ int main(void) {
     int failures = 0;
 
     for (size_t t = 0; t < sizeof(thread_configs) / sizeof(thread_configs[0]); t++) {
-        failures += runMalformedHeaders(thread_configs[t]);
         for (size_t i = 0; i < sizeof(test_cases) / sizeof(test_cases[0]); i++) {
             failures += runCase(&test_cases[i], thread_configs[t]);
         }
     }
 
-    failures += runMalformedHeaders(1);
+    failures += runMalformedHeaders();
 
     if (failures > 0) {
         fprintf(stderr, "%d test(s) failed\n", failures);
